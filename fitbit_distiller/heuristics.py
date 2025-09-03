@@ -51,10 +51,15 @@ def match_metric_key(header: str, category: str) -> Optional[str]:
 def is_session_headers(headers: List[str], category: str) -> bool:
     lh = [h.lower() for h in headers]
     cat = category.lower()
+    # Exclude known non-session categories (per READMEs)
+    if "sleep" in cat:
+        return False
+    if "goal" in cat:
+        return False
+    # Heuristics for session-like files
     has_start = any("start" in h for h in lh)
     has_end = any(h.startswith("end") or " end" in h or "finish" in h for h in lh)
     has_duration = any("duration" in h or ("minutes" in h and "sleep" not in h) for h in lh)
     has_type = any(any(k in h for k in ["activity", "exercise", "workout", "sport"]) for h in lh)
-    if "sleep" in cat:
-        return False
-    return (has_start and (has_end or has_duration)) and (has_type or "activity" in cat or "physical" in cat)
+    # Avoid broad category fallbacks that include 'Activity Goals'
+    return (has_start and (has_end or has_duration)) and (has_type or "mindfulness" in cat)

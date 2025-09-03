@@ -116,16 +116,37 @@ def process_csv_worker(args):
 
             # Key metrics
             calories = num_value(row, headers, ["calories", "calorie", "kcal", "energy"])
-            distance = num_value(row, headers,
-                                 ["distance", "km", "kilometer", "kilometre", "miles", "mi", "meters", "metres"])
+            # Distance: prefer explicit millimeters/meters columns per README, convert to km; else fallback to generic
+            distance = None
+            dist_mm = num_value(row, headers, [
+                "distance_mm", "distance (mm)", "tracker_total_distance_mm", "traveled_distance_mm"
+            ])
+            if dist_mm is not None:
+                distance = dist_mm / 1_000_000.0  # km from mm
+            else:
+                dist_m = num_value(row, headers, ["distance_m", "distance (m)", "meters", "metres"])
+                if dist_m is not None:
+                    distance = dist_m / 1000.0
+                else:
+                    distance = num_value(row, headers,
+                                         ["distance", "km", "kilometer", "kilometre", "miles", "mi"])  # unit unknown
             steps_v = num_value(row, headers, ["steps", "step count", "stepcount", "step"])
             avg_hr = num_value(row, headers,
                                ["average heart", "avg heart", "avg hr", "average hr", "avg bpm", "average bpm",
                                 "mean hr"])
             max_hr = num_value(row, headers, ["max heart", "max hr", "peak heart", "max bpm"])
-            elev_gain = num_value(row, headers,
-                                  ["elevation gain", "elevation (m)", "elevation gain (m)", "elevation gain (ft)",
-                                   "elev gain", "ascent", "climb"])
+            # Elevation gain: prefer millimeters per README, convert to meters; else fallback
+            elev_gain = None
+            elev_mm = num_value(row, headers, [
+                "elevation_gain_mm", "altitude_gain_mm", "tracker_total_altitude_mm", "elevation_mm",
+                "elevation gain (mm)"
+            ])
+            if elev_mm is not None:
+                elev_gain = elev_mm / 1000.0
+            else:
+                elev_gain = num_value(row, headers,
+                                      ["elevation gain", "elevation (m)", "elevation gain (m)", "elevation gain (ft)",
+                                       "elev gain", "ascent", "climb"])
             azm_total = num_value(row, headers, ["active zone minutes", "azm", "zone minutes"])
             azm_fat = num_value(row, headers, ["fat burn minutes", "azm - fat burn", "active zone minutes - fat burn",
                                                "fat burn zone minutes", "fat burn"])
@@ -133,7 +154,7 @@ def process_csv_worker(args):
                                                   "cardio zone minutes", "cardio"])
             azm_peak = num_value(row, headers,
                                  ["peak minutes", "azm - peak", "active zone minutes - peak", "peak zone minutes",
-                                  "peak"])
+                                  "peak"]) 
 
             # Determine session date for aggregation
             if not date_str and start_dt:

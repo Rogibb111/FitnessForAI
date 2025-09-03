@@ -1,8 +1,8 @@
 from __future__ import annotations
 
+import datetime as dt
 import os
 import re
-import datetime as dt
 from typing import Dict, List, Optional
 
 
@@ -120,6 +120,17 @@ def parse_datetime_value(val: str) -> Optional[dt.datetime]:
 
 
 def parse_duration_to_minutes(val: str) -> Optional[float]:
+    """Parse a duration-like value into minutes.
+
+    Supports:
+    - HH:MM:SS or MM:SS strings
+    - Text like '1 hr 20 min', '75 minutes', '90s'
+    - Pure numbers interpreted heuristically:
+      * >= 100000 -> milliseconds (ms)
+      * 1000..99999 -> seconds (s)
+      * otherwise -> minutes (min)
+    This heuristic aligns with Fitbit export READMEs (e.g., Mindfulness duration is in milliseconds).
+    """
     if val is None:
         return None
     s = str(val).strip().lower()
@@ -143,16 +154,34 @@ def parse_duration_to_minutes(val: str) -> Optional[float]:
     m = re.search(r"([\d.]+)\s*(minutes|minute|mins|min|m)", s)
     if m:
         total_min += float(m.group(1))
+    m = re.search(r"([\d.]+)\s*(milliseconds|millisecond|ms)", s)
+    if m:
+        total_min += float(m.group(1)) / 60000.0
     m = re.search(r"([\d.]+)\s*(seconds|second|secs|sec|s)", s)
     if m:
         total_min += float(m.group(1)) / 60.0
     if total_min > 0:
         return total_min
-    # Pure number: treat as minutes
+    # Pure number: apply heuristic
     try:
-        return float(s)
+        num = float(s)
     except Exception:
         return None
+    # If it looks like an integer count, use int for fast checks
+    try:
+        as_int = int(round(num))
+    except Exception:
+        as_int = None
+    if as_int is not None and abs(num - as_int) < 1e-6:
+        # Heuristic thresholds
+        if as_int >= 100000:
+            # milliseconds
+            return as_int / 60000.0
+        if 1000 <= as_int < 100000:
+            # seconds
+            return as_int / 60.0
+    # Default: minutes
+    return float(num)
 
 
 def first_value(row: Dict[str, str], headers: List[str], keywords: List[str]) -> Optional[str]:
