@@ -19,7 +19,7 @@ from fitbit_distiller import (
 
 
 def process_csv_worker(args):
-    import datetime as dt
+    import datetime as dtpcsv
     from collections import defaultdict
     (csv_path, input_root) = args
     category = categorize_path(str(csv_path))
@@ -66,8 +66,8 @@ def process_csv_worker(args):
         # Session extraction
         if session_mode:
             # Start/end datetime parsing with flexible sources
-            start_dt: Optional[dt.datetime] = None
-            end_dt: Optional[dt.datetime] = None
+            start_dt: Optional[dtpcsv.datetime] = None
+            end_dt: Optional[dtpcsv.datetime] = None
             start_candidates = [
                 first_value(row, headers, ["start datetime", "start date time", "start date", "start time", "start"]),
             ]
@@ -116,8 +116,6 @@ def process_csv_worker(args):
 
             # Key metrics
             calories = num_value(row, headers, ["calories", "calorie", "kcal", "energy"])
-            # Distance: prefer explicit millimeters/meters columns per README, convert to km; else fallback to generic
-            distance = None
             dist_mm = num_value(row, headers, [
                 "distance_mm", "distance (mm)", "tracker_total_distance_mm", "traveled_distance_mm"
             ])
@@ -135,8 +133,6 @@ def process_csv_worker(args):
                                ["average heart", "avg heart", "avg hr", "average hr", "avg bpm", "average bpm",
                                 "mean hr"])
             max_hr = num_value(row, headers, ["max heart", "max hr", "peak heart", "max bpm"])
-            # Elevation gain: prefer millimeters per README, convert to meters; else fallback
-            elev_gain = None
             elev_mm = num_value(row, headers, [
                 "elevation_gain_mm", "altitude_gain_mm", "tracker_total_altitude_mm", "elevation_mm",
                 "elevation gain (mm)"
@@ -222,7 +218,7 @@ def process_csv_worker(args):
         "metric_hits": dict(metric_hits),
         "errors": errors,
     }
-    return (local_daily, local_sessions, index_record, rel_path)
+    return local_daily, local_sessions, index_record, rel_path
 
 
 def main():
@@ -232,6 +228,8 @@ def main():
     parser.add_argument("--no-progress", action="store_true", help="Disable console progress bar output")
     parser.add_argument("--workers", type=int, default=(os.cpu_count() or 1),
                         help="Number of parallel worker processes (default: CPU count)")
+    # Allow forcing progress output even if stderr is not a TTY (e.g., some IDE consoles)
+    parser.add_argument("--force-progress", action="store_true", help="Show progress even if stderr is not a TTY")
     args = parser.parse_args()
 
     # Ensure argparse values are typed as str for path operations
@@ -244,7 +242,7 @@ def main():
         stderr_isatty = sys.stderr.isatty()
     except Exception:
         stderr_isatty = False
-    show_progress = (not args.no_progress) and stderr_isatty
+    show_progress = (not args.no_progress) and (stderr_isatty or args.force_progress)
 
     files_index_path = os.path.join(output_root, "fitbit_files_index.jsonl")
     daily_out_path = os.path.join(output_root, "fitbit_daily_distilled.jsonl")
@@ -267,7 +265,7 @@ def main():
     pace_series: Dict[str, List[Tuple[dt.datetime, Optional[float], Optional[float], Optional[float]]]] = {}
     # pace tuple: (timestamp, steps, distance_mm, altitude_gain_mm)
 
-    # Prepare list of CSV files and progress bar
+    # Prepare a list of CSV files and progress bar
     csv_paths: List[str] = []
     for root, _, files in os.walk(input_root):
         for name in files:
@@ -275,34 +273,101 @@ def main():
                 csv_paths.append(os.path.join(root, name))
     total_csv = len(csv_paths)
 
-    def _print_progress(done: int, total: int, current_rel: Optional[str] = None) -> None:
+    # Pre-scan heart rate and live pace series for enrichment and auto session detection
+    # This pass is lightweight and avoids changing worker return types.
+    if not args.no_progress:
+        try:
+            sys.stderr.write("Pre-scanning time series (heart rate / live pace)...\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+    prescan_count = 0
+    for csv_path in csv_paths:
+        name_low = os.path.basename(csv_path).lower()
+        try:
+            if "live_pace_" in name_low:
+                headers, rows_iter, _enc, _errs = read_csv_stream(csv_path)
+                if headers:
+                    lower_map = {h.lower().strip(): h for h in headers}
+                    ts_k = lower_map.get("timestamp")
+                    steps_k = lower_map.get("steps")
+                    dist_k = lower_map.get("distance millimeters")
+                    alt_k = lower_map.get("altitude gain millimeters")
+                    for row in rows_iter:
+                        ts = parse_datetime_value(row.get(ts_k) if ts_k else None)
+                        if not isinstance(ts, dt.datetime):
+                            continue
+                        dkey = ts.date().isoformat()
+                        steps_v = to_float(row.get(steps_k)) if steps_k else None
+                        dist_mm = to_float(row.get(dist_k)) if dist_k else None
+                        alt_mm = to_float(row.get(alt_k)) if alt_k else None
+                        if dkey not in pace_series:
+                            pace_series[dkey] = []
+                        pace_series[dkey].append((ts, steps_v, dist_mm, alt_mm))
+            elif "heart_rate_" in name_low:
+                headers, rows_iter, _enc, _errs = read_csv_stream(csv_path)
+                if headers:
+                    lower_map = {h.lower().strip(): h for h in headers}
+                    ts_k = lower_map.get("timestamp")
+                    bpm_k = lower_map.get("beats per minute")
+                    for row in rows_iter:
+                        ts = parse_datetime_value(row.get(ts_k) if ts_k else None)
+                        if not isinstance(ts, dt.datetime):
+                            continue
+                        bpm = to_float(row.get(bpm_k)) if bpm_k else None
+                        if bpm is None:
+                            continue
+                        dkey = ts.date().isoformat()
+                        if dkey not in hr_series:
+                            hr_series[dkey] = []
+                        hr_series[dkey].append((ts, float(bpm)))
+        except Exception:
+            # Ignore errors in pre-scan to avoid blocking the main processing
+            pass
+        finally:
+            prescan_count += 1
+            if show_progress and total_csv > 0:
+                # Lightweight pre-scan indicator (separate from the main progress bar)
+                try:
+                    sys.stderr.write(f"\rPre-scan: {prescan_count}/{total_csv}")
+                    sys.stderr.flush()
+                except Exception:
+                    pass
+    if show_progress and total_csv > 0:
+        try:
+            sys.stderr.write("\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+    def _print_progress(done_print: int, total: int, current_rel: Optional[str] = None) -> None:
         try:
             cols = shutil.get_terminal_size(fallback=(80, 20)).columns
         except Exception:
             cols = 80
-        prefix = f"Processing CSVs: {done}/{total} "
+        prefix = f"Processing CSVs: {done_print}/{total} "
         suffix = ""
         if total > 0:
-            pct = int(done * 100 / total)
+            pct = int(done_print * 100 / total)
             suffix = f"({pct}%)"
         # Reserve space for prefix, suffix, and a minimal bar
         bar_space = max(10, cols - len(prefix) - len(suffix) - 5)
         # Build bar
         filled = 0
         if total > 0:
-            filled = int(bar_space * done / total)
+            filled = int(bar_space * done_print / total)
         bar = "#" * filled + "-" * (bar_space - filled)
         line = f"\r{prefix}[{bar}] {suffix}"
-        # Show current file (trim if needed)
+        # Show the current file (trim if needed)
         if current_rel:
             max_name = max(0, cols - len(line) - 3)
             name_disp = current_rel if len(current_rel) <= max_name else "…" + current_rel[-(max_name - 1):]
             line += f" {name_disp}"
-        # Ensure line doesn't overflow
+        # Ensure the line doesn't overflow
         line = line[:cols - 1]
         sys.stderr.write(line)
         sys.stderr.flush()
-        if done >= total:
+        if done_print >= total:
             sys.stderr.write("\n")
             sys.stderr.flush()
 
@@ -361,6 +426,103 @@ def main():
         lst.sort(key=lambda x: x[0])
     for dkey, lst in pace_series.items():
         lst.sort(key=lambda x: x[0])
+
+    # Auto-detect sessions from live pace series (contiguous movement)
+    existing_keys = set()
+    for rec in sessions_buffer:
+        s = rec.get("start")
+        if s:
+            existing_keys.add((s, rec.get("category"), rec.get("source_path")))
+
+    min_duration_min = 10.0
+    gap_allow_sec = 180  # allow up to 3 minutes of inactivity within a session
+
+    for dkey, points in pace_series.items():
+        if not points:
+            continue
+        # points are sorted
+        in_session = False
+        sess_start: Optional[dt.datetime] = None
+        last_active: Optional[dt.datetime] = None
+        steps_sum = 0.0
+        dist_mm_sum = 0.0
+        alt_mm_sum = 0.0
+
+        def _flush_session():
+            nonlocal in_session, sess_start, last_active, steps_sum, dist_mm_sum, alt_mm_sum
+            if in_session and sess_start and last_active:
+                duration_min = (last_active - sess_start).total_seconds() / 60.0
+                if duration_min >= min_duration_min:
+                    start_iso = sess_start.isoformat()
+                    key = (start_iso, "Physical Activity_GoogleData", "Physical Activity_GoogleData/live_pace_*.csv")
+                    if key not in existing_keys:
+                        rec_fl = {
+                            "date": sess_start.date().isoformat(),
+                            "start": start_iso,
+                            "end": last_active.isoformat(),
+                            "duration_min": round(duration_min, 3),
+                            "type": "Auto (live pace)",
+                            "steps": round(steps_sum, 3) if steps_sum > 0 else None,
+                            "distance": round(dist_mm_sum / 1_000_000.0, 6) if dist_mm_sum > 0 else None,
+                            "elevation_gain_m": round(alt_mm_sum / 1000.0, 3) if alt_mm_sum > 0 else None,
+                            "category": "Physical Activity_GoogleData",
+                            "source_path": "Physical Activity_GoogleData/live_pace_*.csv",
+                            "_start_dt": sess_start,
+                            "_end_dt": last_active,
+                        }
+                        sessions_buffer.append(rec_fl)
+                        existing_keys.add(key)
+            # reset
+            in_session = False
+            sess_start = None
+            last_active = None
+            steps_sum = 0.0
+            dist_mm_sum = 0.0
+            alt_mm_sum = 0.0
+
+        for ts, steps_v, dist_mm, alt_mm in points:
+            moved = ((steps_v or 0.0) > 0.0) or ((dist_mm or 0.0) > 0.0)
+            if not in_session:
+                if moved:
+                    in_session = True
+                    sess_start = ts
+                    last_active = ts
+                    steps_sum = (steps_v or 0.0)
+                    dist_mm_sum = (dist_mm or 0.0)
+                    alt_mm_sum = (alt_mm or 0.0)
+                else:
+                    # idle, skip
+                    continue
+            else:
+                # we are in a session
+                # Check gap since last_active
+                if last_active and (ts - last_active).total_seconds() > gap_allow_sec:
+                    # too long gap -> end the current session and possibly start a new one
+                    _flush_session()
+                    if moved:
+                        in_session = True
+                        sess_start = ts
+                        last_active = ts
+                        steps_sum = (steps_v or 0.0)
+                        dist_mm_sum = (dist_mm or 0.0)
+                        alt_mm_sum = (alt_mm or 0.0)
+                    else:
+                        in_session = False
+                        sess_start = None
+                        last_active = None
+                        steps_sum = 0.0
+                        dist_mm_sum = 0.0
+                        alt_mm_sum = 0.0
+                else:
+                    # within the allowed gap window
+                    if moved:
+                        last_active = ts
+                        steps_sum += (steps_v or 0.0)
+                        dist_mm_sum += (dist_mm or 0.0)
+                        alt_mm_sum += (alt_mm or 0.0)
+                    # else keep the session open within an allowed gap
+        # End of day: flush any pending session
+        _flush_session()
 
     # Enrich buffered sessions using time-series data
     with open(sessions_out_path, "w", encoding="utf-8") as sessions_f:
