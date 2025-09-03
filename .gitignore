@@ -1,0 +1,12 @@
+# Ignore local raw datasets and exports
+/data/
+
+# Optionally ignore generated outputs (uncomment if desired)
+/distilled/
+
+# Python typical ignores (kept minimal as per issue scope)
+__pycache__/
+*.pyc
+
+# Jetbrains files
+.idea
